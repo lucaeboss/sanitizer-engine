@@ -1,5 +1,4 @@
 #!/bin/bash
-# filepath: /Users/zler/sanitizer-engine/sanitizer-engine.sh
 set -o pipefail
 
 MAX_ENTROPY="${MAX_ENTROPY:-7.5}"
@@ -10,14 +9,13 @@ PROCESSING_STATUS="${PROCESSING_STATUS:-PROCESSING}"
 JOB_STATUS_COMPLETE="${JOB_STATUS_COMPLETE:-COMPLETED}"
 JOB_STATUS_FAILED="${JOB_STATUS_FAILED:-QUARANTINED}"
 TOPIC_CLEAN="${TOPIC_CLEAN:-sanitized_stream}"
-YARA_RULES="${YARA_RULES:-/app/rules/rules.yar}"
+YARA_RULES="${YARA_RULES:-rules/rules.yar}"
 
 : "${DB_HOST:=localhost}"
 : "${DB_USER:=user}"
 : "${DB_PASSWORD:=password}"
 : "${DB_NAME:=sanitizer_db}"
 
-# Required env: KAFKA_BOOTSTRAP
 trap 'rm -f /dev/shm/tmp_*' EXIT
 
 mysql_exec() {
@@ -41,7 +39,6 @@ while true; do
   " | while IFS=$'\t' read -r job_id file_name payload_b64; do
     [[ -z "$job_id" || -z "$payload_b64" ]] && continue
 
-    # Optimistic lock: claim only if still PENDING.
     claimed="$(mysql_exec "
       UPDATE job_request
       SET status='${PROCESSING_STATUS}'
@@ -50,26 +47,32 @@ while true; do
     " | tail -n1)"
     [[ "$claimed" != "1" ]] && continue
 
-    # Entropy gate (stdin -> Python helper). Protocol: echo "$BASE64_DATA" | base64 -d | python3 entropy_check.py
     if ! entropy_out=$(echo "$payload_b64" | base64 -d | python3 entropy_check.py "$MAX_ENTROPY" 2>&1); then
       echo "failed(entropy): id=${job_id} msg=${entropy_out}" >&2
       mark_failed "$job_id"
       continue
     fi
 
-    # MIME validation.
     mime_type="$(file -b --mime-type <(echo "$payload_b64" | base64 -d) 2>/dev/null || true)"
     [[ -z "$mime_type" ]] && { echo "failed(mime): id=${job_id}" >&2; mark_failed "$job_id"; continue; }
 
-    # YARA scan (process substitution, no disk I/O).
+    echo "[INFO] Running YARA scan on job ${job_id}"
+
     if ! yara_out="$(yara "$YARA_RULES" <(echo "$payload_b64" | base64 -d) 2>/dev/null)"; then
       echo "failed(yara-error): id=${job_id}" >&2
       mark_failed "$job_id"
       continue
     fi
-    [[ -n "$yara_out" ]] && { echo "failed(yara-hit): id=${job_id} hit=${yara_out}" >&2; mark_failed "$job_id"; continue; }
 
-    # Metadata scrub (Exif) for common metadata-bearing types; passthrough otherwise.
+    if [[ -n "$yara_out" ]]; then
+      echo "[YARA DETECTION] id=${job_id}"
+      echo "[YARA MATCH] ${yara_out}"
+      mark_failed "$job_id"
+      continue
+    else
+      echo "[YARA CLEAN] id=${job_id}"
+    fi
+
     case "$mime_type" in
       image/*|application/pdf)
         sanitized_b64="$(
@@ -81,9 +84,9 @@ while true; do
         sanitized_b64="$payload_b64"
         ;;
     esac
+
     [[ -z "$sanitized_b64" ]] && { echo "failed(sanitize): id=${job_id}" >&2; mark_failed "$job_id"; continue; }
 
-    # Publish only after all checks pass.
     msg="$(jq -nc \
       --arg filename "$file_name" \
       --arg payload "$sanitized_b64" \
